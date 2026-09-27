@@ -1,0 +1,10 @@
+build/
+dist/
+artifacts/
+*.DS_Store
+*.keystore
+*.jks
+.env
+.env.*
+__pycache__/
+*.pyc
