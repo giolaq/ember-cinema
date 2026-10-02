@@ -6,7 +6,7 @@ A native Fire TV streaming demo. All authored application code is C: home screen
 
 ## Run on Fire TV
 
-Supports **Fire OS 7 and newer Android-based Fire TV devices**, ARMv7 and ARM64. Requires Android API 26+ to use accurate seeking. This APK does not run on Vega OS devices.
+Supports **Fire OS 7 and newer Android-based Fire TV devices**, ARMv7 and ARM64. Requires Android API 26+ to use accurate seeking. This APK does not run on Vega OS devices; see [Run on Vega OS](#run-on-vega-os).
 
 Build the source using the instructions below to produce `dist/ember-cinema.apk`, a debug-signed APK.
 
@@ -69,16 +69,33 @@ Small C state tests can run on a host C compiler:
 ```sh
 cc -std=c11 -Isrc tests/model_test.c -o /tmp/ember-model-test
 /tmp/ember-model-test
+cc -std=c11 -Isrc tests/ember_test.c src/ember.c -o /tmp/ember-core-test
+/tmp/ember-core-test
 ```
 
 The C state tests were also cross-compiled with the NDK and executed on the emulator.
 
 Validation uses the Android TV API 34 ARM64 emulator at 1920×1080. A physical Fire TV is not connected, so real-device compatibility, audio output and remote behavior still deserve a hardware acceptance pass. The ARMv7 binary is built but has not been run on ARMv7 hardware.
 
+## Run on Vega OS
+
+`vega/` is a React Native for Vega (RN 0.83, Vega SDK 0.24+) app built on the same C core. `src/ember.c` (catalog, navigation, controls and player state) is compiled into the `EmberCore` C++ Turbo Module. React Native renders the screens and plays streams with the W3C `VideoPlayer`. Remote keys go through `useTVEventHandler` straight into the C core.
+
+```sh
+cd vega
+npm install
+npm run build:debug   # or build:release
+vega run-app build/armv7-debug/embercinema_armv7.vpkg tv.cinema.ember.main -d DEVICE_SERIAL
+```
+
+Use the `aarch64` or `x86_64` package for those devices (`vega device info` shows the architecture). `npm test` runs the JS tests against a mocked Turbo Module. Verified on a Fire TV Stick running Vega OS 1.2 (armv7): the remote's OK key arrives there as `kpenter`.
+
 ## Implementation
 
-- `src/main.c`: native activity, JNI player, GL UI, catalog and remote input.
+- `src/ember.c`, `src/ember.h`: platform-neutral catalog, navigation, remote-key handling and player state, shared by Android and Vega.
+- `src/main.c`: Android native activity, JNI player, GL UI and key mapping onto the core.
 - `src/model.h`: focus, control timeout and seek clamping.
+- `vega/`: Vega app; `vega/kepler/turbo-modules/EmberCore.cpp` wraps the C core as a Turbo Module.
 - `assets/`: four JPEG movie stills.
 - `vendor/`: stb image decoding and TrueType rasterization, with embedded licenses.
 - `AndroidManifest.xml`: TV launcher entry, network permission, no touchscreen requirement.
