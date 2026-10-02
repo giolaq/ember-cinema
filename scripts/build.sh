@@ -10,7 +10,7 @@ CC="$NDK/toolchains/llvm/prebuilt/$HOST/bin"
 mkdir -p build/apk/lib/{arm64-v8a,armeabi-v7a} dist
 for spec in 'arm64-v8a:aarch64-linux-android' 'armeabi-v7a:armv7a-linux-androideabi'; do
   abi="${spec%%:*}"; target="${spec#*:}"
-  "$CC/${target}26-clang" -std=c11 -O2 -g -fPIC -shared -Wall -Wextra -Wno-unused-parameter -Werror=implicit-function-declaration -Isrc -Ivendor -I"$NDK/sources/android/native_app_glue" src/main.c "$NDK/sources/android/native_app_glue/android_native_app_glue.c" -o "build/apk/lib/$abi/libember.so" -landroid -llog -lEGL -lGLESv2 -lm -Wl,-u,ANativeActivity_onCreate -Wl,-z,max-page-size=16384
+  "$CC/${target}26-clang" -std=c11 -O2 -g -fPIC -shared -Wall -Wextra -Wno-unused-parameter -Werror=implicit-function-declaration -Isrc -Ivendor -I"$NDK/sources/android/native_app_glue" src/main.c src/ember.c "$NDK/sources/android/native_app_glue/android_native_app_glue.c" -o "build/apk/lib/$abi/libember.so" -landroid -llog -lEGL -lGLESv2 -lm -Wl,-u,ANativeActivity_onCreate -Wl,-z,max-page-size=16384
  done
 "$BT/aapt" package -f -M AndroidManifest.xml -S res -A assets -I "$SDK/platforms/android-34/android.jar" -F build/unsigned.apk
 (cd build/apk && zip -q -r ../unsigned.apk lib)

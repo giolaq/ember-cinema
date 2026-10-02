@@ -1,5 +1,5 @@
 #define _POSIX_C_SOURCE 200809L
-#include "model.h"
+#include "ember.h"
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
 #include <GLES2/gl2ext.h>
@@ -23,31 +23,9 @@
 #define LOG(...) __android_log_print(ANDROID_LOG_INFO, "Ember", __VA_ARGS__)
 
 typedef struct {
-    const char *title, *tag, *description, *poster, *url;
-} Movie;
-static const Movie movies[] = {
-    {"Sintel", "FANTASY  /  2010  /  TRAILER",
-     "A young traveler searches for the dragon she once befriended.\nAn "
-     "extraordinary journey from the Blender open movie project.",
-     "sintel.jpg", "https://media.w3.org/2010/05/sintel/trailer.mp4"},
-    {"Big Buck Bunny", "ANIMATION  /  2008  /  10-SECOND PREVIEW",
-     "A gentle giant. Three mischievous woodland creatures.\nA sunlit "
-     "adventure from the Blender open movie project.",
-     "bunny.jpg",
-     "https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/720/Big_Buck_Bunny_720_10s_1MB.mp4"},
-    {"Sintel: The Journey", "DEMO COLLECTION  /  FANTASY",
-     "Return to a world of snowy peaks and unlikely friendship.\nThis "
-     "collection tile plays the Sintel trailer.",
-     "journey.jpg", "https://media.w3.org/2010/05/sintel/trailer.mp4"},
-    {"Bunny: The Meadow", "DEMO COLLECTION  /  ANIMATION",
-     "A little escape into a beautifully animated woodland.\nThis "
-     "collection tile plays the Big Buck Bunny demo clip.",
-     "meadow.jpg",
-     "https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/720/Big_Buck_Bunny_720_10s_1MB.mp4"}};
-typedef struct {
     struct android_app *app;
     JNIEnv *env;
-    Model model;
+    Ember core;
     EGLDisplay display;
     EGLSurface surface;
     EGLContext context;
@@ -59,12 +37,11 @@ typedef struct {
     jobject mp, st, vs;
     pthread_t worker;
     atomic_int loading;
-    bool worker_live, cancelled, started, paused, ended;
-    int duration, position, vw, vh;
-    double last_poll, last_report, seek_grace, video_start;
+    bool worker_live, cancelled;
+    int vw, vh;
+    double last_poll, last_report, video_start;
     jlong video_stamp;
     int video_frames;
-    char error[160];
 } App;
 static double now(void) {
     struct timespec t;
@@ -211,7 +188,7 @@ static void assets(App *a) {
         free(rgba);
     }
     for (int i = 0; i < 4; i++) {
-        AAsset *asset = AAssetManager_open(a->app->activity->assetManager, movies[i].poster,
+        AAsset *asset = AAssetManager_open(a->app->activity->assetManager, ember_movies[i].poster,
                                            AASSET_MODE_BUFFER);
         if (asset) {
             int w, h, c;
@@ -267,7 +244,7 @@ static void release_player(App *a) {
         a->video_texture = 0;
     }
     exception(a->env);
-    a->started = false;
+    a->core.started = false;
     a->cancelled = false;
     atomic_store(&a->loading, 0);
 }
@@ -275,24 +252,15 @@ static void stop_player(App *a) {
     a->cancelled = true;
     if (atomic_load(&a->loading) != 1)
         release_player(a);
-    a->model.screen = DETAILS;
+    ember_stop(&a->core);
 }
 static void start_player(App *a) {
     if (a->mp) {
-        snprintf(a->error, sizeof a->error,
-                 "Finishing the previous connection. Try again shortly.");
+        ember_player_busy(&a->core);
         return;
     }
-    a->error[0] = 0;
-    a->model.screen = PLAYER;
-    a->model.control = 1;
-    reveal(&a->model, now());
-    a->position = 0;
-    a->duration = 0;
     a->video_stamp = 0;
     a->video_frames = 0;
-    a->paused = false;
-    a->ended = false;
     JNIEnv *e = a->env;
     glGenTextures(1, &a->video_texture);
     glBindTexture(GL_TEXTURE_EXTERNAL_OES, a->video_texture);
@@ -319,48 +287,45 @@ static void start_player(App *a) {
     (*e)->CallVoidMethod(e, a->mp, method(e, a->mp, "setSurface", "(Landroid/view/Surface;)V"),
                          a->vs);
     if (exception(e)) {
-        snprintf(a->error, sizeof a->error, "Unable to create the video player.");
+        ember_player_failed(&a->core, "Unable to create the video player.");
         release_player(a);
         return;
     }
-    a->play_url = movies[a->model.movie].url;
+    a->play_url = ember_movies[a->core.model.movie].url;
     atomic_store(&a->loading, 1);
     if (pthread_create(&a->worker, 0, prepare, a) != 0) {
         atomic_store(&a->loading, -1);
     } else
         a->worker_live = true;
-    LOG("screen=player movie=%d loading", a->model.movie);
+    LOG("screen=player movie=%d loading", a->core.model.movie);
 }
-static void toggle(App *a) {
-    if (!a->started)
-        return;
-    if (a->ended) {
-        (*a->env)->CallVoidMethod(a->env, a->mp, method(a->env, a->mp, "seekTo", "(JI)V"), (jlong)0,
-                                  3);
-        a->position = 0;
-        a->seek_grace = now() + 1.0;
-        a->ended = false;
-        a->paused = true;
-    }
-    call(a, a->mp, a->paused ? "start" : "pause");
-    a->paused = !a->paused;
-    exception(a->env);
-    LOG("paused=%d position=%d", a->paused, a->position);
-}
-static void seek(App *a, int delta) {
-    if (!a->started)
-        return;
-    int p = seek_target(integer(a, "getCurrentPosition"), delta, a->duration);
+static void seek_to(App *a, int p) {
     if (a->sdk >= 26)
         (*a->env)->CallVoidMethod(a->env, a->mp, method(a->env, a->mp, "seekTo", "(JI)V"), (jlong)p,
                                   3);
     else
         (*a->env)->CallVoidMethod(a->env, a->mp, method(a->env, a->mp, "seekTo", "(I)V"), p);
-    a->position = p;
-    a->seek_grace = now() + 1.0;
-    a->ended = p >= a->duration;
-    exception(a->env);
-    LOG("seek=%d", p);
+}
+// Carries out the platform side of a core state change.
+static void perform(App *a, EmberAction act) {
+    if (act.type == EA_START)
+        start_player(a);
+    else if (act.type == EA_STOP)
+        stop_player(a);
+    else if (act.type == EA_EXIT)
+        ANativeActivity_finish(a->app->activity);
+    else if (a->mp) {
+        if (act.type == EA_REPLAY)
+            seek_to(a, 0);
+        if (act.type == EA_SEEK) {
+            seek_to(a, act.position);
+            LOG("seek=%d", act.position);
+        } else {
+            call(a, a->mp, act.type == EA_PAUSE ? "pause" : "start");
+            LOG("paused=%d position=%d", a->core.paused, a->core.position);
+        }
+        exception(a->env);
+    }
 }
 static void poll_player(App *a) {
     int state = atomic_load(&a->loading);
@@ -368,59 +333,54 @@ static void poll_player(App *a) {
         release_player(a);
         return;
     }
-    if (a->model.screen != PLAYER)
+    if (a->core.model.screen != PLAYER)
         return;
     if (state == -1) {
-        snprintf(a->error, sizeof a->error,
-                 "Could not stream this film. Check your connection and try again.");
+        ember_player_failed(&a->core,
+                            "Could not stream this film. Check your connection and try again.");
         release_player(a);
         LOG("playback error");
         return;
     }
-    if (state == 2 && !a->started) {
+    if (state == 2 && !a->core.started) {
         if (a->worker_live) {
             pthread_join(a->worker, 0);
             a->worker_live = false;
         }
-        a->duration = integer(a, "getDuration");
+        int duration = integer(a, "getDuration");
         a->vw = integer(a, "getVideoWidth");
         a->vh = integer(a, "getVideoHeight");
         call(a, a->mp, "start");
         if (exception(a->env)) {
-            snprintf(a->error, sizeof a->error, "Playback could not start. Press Back to retry.");
+            ember_player_failed(&a->core, "Playback could not start. Press Back to retry.");
             release_player(a);
             return;
         }
-        a->started = true;
+        ember_player_ready(&a->core, duration, now());
         a->video_start = now();
-        reveal(&a->model, now());
-        LOG("playing duration=%d video=%dx%d", a->duration, a->vw, a->vh);
+        LOG("playing duration=%d video=%dx%d", duration, a->vw, a->vh);
     }
-    if (a->started && now() - a->last_report > 1) {
+    if (a->core.started && now() - a->last_report > 1) {
         a->last_report = now();
-        LOG("status position=%d paused=%d controls=%d frames=%d", a->position, a->paused,
-            controls_visible(&a->model, now()), a->video_frames);
+        LOG("status position=%d paused=%d controls=%d frames=%d", a->core.position,
+            a->core.paused, controls_visible(&a->core.model, now()), a->video_frames);
     }
-    if (a->started && now() - a->last_poll > .25) {
+    if (a->core.started && now() - a->last_poll > .25) {
         a->last_poll = now();
-        a->position = integer(a, "getCurrentPosition");
+        int position = integer(a, "getCurrentPosition");
         bool playing =
             (*a->env)->CallBooleanMethod(a->env, a->mp, method(a->env, a->mp, "isPlaying", "()Z"));
         if (exception(a->env)) {
-            snprintf(a->error, sizeof a->error, "Playback interrupted. Press Back and try again.");
+            ember_player_failed(&a->core, "Playback interrupted. Press Back and try again.");
             release_player(a);
             return;
         }
-        if (!playing && !a->paused && now() > a->seek_grace && a->position >= a->duration - 500) {
-            a->ended = true;
-            a->paused = true;
-            reveal(&a->model, now());
+        if (ember_player_progress(&a->core, position, playing, now()))
             LOG("ended");
-        }
     }
 }
 static void draw_video(App *a) {
-    if (!a->started)
+    if (!a->core.started)
         return;
     call(a, a->st, "updateTexImage");
     if (exception(a->env))
@@ -430,11 +390,10 @@ static void draw_video(App *a) {
     if (stamp != a->video_stamp) {
         a->video_stamp = stamp;
         if (++a->video_frames == 1)
-            LOG("video-frame movie=%d", a->model.movie);
+            LOG("video-frame movie=%d", a->core.model.movie);
     }
     if (!a->video_frames && now() - a->video_start > 10) {
-        snprintf(a->error, sizeof a->error,
-                 "No video frames received. Press Back to try another film.");
+        ember_player_failed(&a->core, "No video frames received. Press Back to try another film.");
         release_player(a);
         return;
     }
@@ -460,34 +419,35 @@ static void render(App *a) {
     glClear(GL_COLOR_BUFFER_BIT);
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    int sel = a->model.movie;
-    const Movie *m = &movies[sel];
-    if (a->model.screen == PLAYER) {
+    Ember *c = &a->core;
+    int sel = c->model.movie;
+    const Movie *m = &ember_movies[sel];
+    if (c->model.screen == PLAYER) {
         draw_video(a);
-        if (!a->started) {
+        if (!c->started) {
             accent(a, 64, 100, 20, "EMBER  /  NOW PLAYING");
             label(a, 64, 164, 42, m->title);
-            label(a, 64, 240, 23, a->error[0] ? a->error : "Connecting to your film...");
+            label(a, 64, 240, 23, c->error[0] ? c->error : "Connecting to your film...");
             label(a, 64, 660, 20, "BACK  Return to details");
-        } else if (controls_visible(&a->model, now()) || a->ended) {
+        } else if (ember_controls_shown(c, now())) {
             for (int i = 0; i < 24; i++)
                 rect(a, 0, 420 + i * 12.5, 1280, 12.5, 0.02, .035, .06, i / 25.f * .94);
             label(a, 64, 498, 30, m->title);
-            accent(a, 1080, 498, 18, a->ended ? "FINISHED" : a->paused ? "PAUSED" : "PLAYING");
+            accent(a, 1080, 498, 18, c->ended ? "FINISHED" : c->paused ? "PAUSED" : "PLAYING");
             rect(a, 64, 530, 1152, 4, .30, .35, .41, 1);
-            rect(a, 64, 530, a->duration ? 1152.f * a->position / a->duration : 0, 4, .98, .70, .43,
+            rect(a, 64, 530, c->duration ? 1152.f * c->position / c->duration : 0, 4, .98, .70, .43,
                  1);
             char time[80];
-            snprintf(time, sizeof time, "%02d:%02d  /  %02d:%02d", a->position / 60000,
-                     a->position / 1000 % 60, a->duration / 60000, a->duration / 1000 % 60);
+            snprintf(time, sizeof time, "%02d:%02d  /  %02d:%02d", c->position / 60000,
+                     c->position / 1000 % 60, c->duration / 60000, c->duration / 1000 % 60);
             label(a, 64, 568, 20, time);
-            button(a, 420, 585, 138, "- 10 sec", a->model.control == 0);
+            button(a, 420, 585, 138, "- 10 sec", c->model.control == 0);
             button(a, 574, 585, 138,
-                   a->ended    ? "Replay"
-                   : a->paused ? "Play"
+                   c->ended    ? "Replay"
+                   : c->paused ? "Play"
                                : "Pause",
-                   a->model.control == 1);
-            button(a, 728, 585, 138, "+ 10 sec", a->model.control == 2);
+                   c->model.control == 1);
+            button(a, 728, 585, 138, "+ 10 sec", c->model.control == 2);
             label(a, 64, 680, 18, "LEFT / RIGHT  Choose     OK  Select     BACK  Movie details");
         }
     } else {
@@ -500,7 +460,7 @@ static void render(App *a) {
         accent(a, 64, 62, 24, "E M B E R");
         label(a, 275, 62, 18, "C I N E M A");
         text_at(a, 1020, 62, 18, "THE DEMO EDITION", .57, .65, .73);
-        if (a->model.screen == HOME) {
+        if (c->model.screen == HOME) {
             accent(a, 64, 131, 17, "SMALL FILMS. BIG WORLDS.");
             label(a, 64, 195, 46, m->title);
             text_at(a, 64, 234, 18, m->tag, .65, .73, .81);
@@ -513,7 +473,7 @@ static void render(App *a) {
                     rect(a, x - 4, 410, 280, 212, .98, .70, .43, 1);
                 rect(a, x, 414, 272, 204, .075, .105, .15, 1);
                 image_at(a, a->posters[i], x, 414, 272, 153, 1);
-                label(a, x + 12, 598, 21, movies[i].title);
+                label(a, x + 12, 598, 21, ember_movies[i].title);
                 if (i == sel) {
                     rect(a, x + 10, 425, 62, 24, .98, .70, .43, 1);
                     text_at(a, x + 20, 443, 14, "PLAY", .03, .04, .07);
@@ -531,86 +491,69 @@ static void render(App *a) {
             text_at(a, 64, 565, 18,
                     "(c) Blender Foundation | sintel.org | bigbuckbunny.org | CC BY 3.0", .55, .63,
                     .72);
-            if (a->error[0])
-                accent(a, 64, 610, 18, a->error);
+            if (c->error[0])
+                accent(a, 64, 610, 18, c->error);
             label(a, 64, 675, 18, "OK  Play     BACK  Browse movies");
         }
     }
     eglSwapBuffers(a->display, a->surface);
 }
+static EmberKey key_of(int code) {
+    switch (code) {
+    case AKEYCODE_DPAD_CENTER:
+    case AKEYCODE_ENTER:
+    case AKEYCODE_NUMPAD_ENTER:
+        return EK_OK;
+    case AKEYCODE_DPAD_LEFT:
+        return EK_LEFT;
+    case AKEYCODE_DPAD_RIGHT:
+        return EK_RIGHT;
+    case AKEYCODE_DPAD_UP:
+        return EK_UP;
+    case AKEYCODE_DPAD_DOWN:
+        return EK_DOWN;
+    case AKEYCODE_BACK:
+    case AKEYCODE_ESCAPE:
+        return EK_BACK;
+    case AKEYCODE_MEDIA_PLAY_PAUSE:
+    case AKEYCODE_SPACE:
+        return EK_PLAY_PAUSE;
+    case AKEYCODE_MEDIA_PLAY:
+        return EK_PLAY;
+    case AKEYCODE_MEDIA_PAUSE:
+        return EK_PAUSE;
+    case AKEYCODE_MEDIA_FAST_FORWARD:
+        return EK_FAST_FORWARD;
+    case AKEYCODE_MEDIA_REWIND:
+        return EK_REWIND;
+    default:
+        return EK_NONE;
+    }
+}
 static int32_t input(struct android_app *app, AInputEvent *event) {
     App *a = app->userData;
     if (AInputEvent_getType(event) != AINPUT_EVENT_TYPE_KEY)
         return 0;
-    int key = AKeyEvent_getKeyCode(event);
-    bool handled = key == AKEYCODE_DPAD_CENTER || key == AKEYCODE_ENTER ||
-                   key == AKEYCODE_NUMPAD_ENTER || key == AKEYCODE_DPAD_LEFT ||
-                   key == AKEYCODE_DPAD_RIGHT || key == AKEYCODE_DPAD_UP ||
-                   key == AKEYCODE_DPAD_DOWN || key == AKEYCODE_BACK || key == AKEYCODE_ESCAPE ||
-                   key == AKEYCODE_MEDIA_PLAY_PAUSE || key == AKEYCODE_MEDIA_PLAY ||
-                   key == AKEYCODE_MEDIA_PAUSE || key == AKEYCODE_MEDIA_FAST_FORWARD ||
-                   key == AKEYCODE_MEDIA_REWIND || key == AKEYCODE_SPACE;
-    if (!handled)
+    EmberKey key = key_of(AKeyEvent_getKeyCode(event));
+    if (key == EK_NONE)
         return 0;
     if (AKeyEvent_getAction(event) != AKEY_EVENT_ACTION_DOWN)
         return 1;
+    // Seeks are relative to the live position rather than the last poll.
+    if (a->core.started) {
+        a->core.position = integer(a, "getCurrentPosition");
+        exception(a->env);
+    }
     bool repeat = AKeyEvent_getRepeatCount(event) > 0;
-    bool ok = key == AKEYCODE_DPAD_CENTER || key == AKEYCODE_ENTER || key == AKEYCODE_NUMPAD_ENTER;
-    bool left = key == AKEYCODE_DPAD_LEFT, right = key == AKEYCODE_DPAD_RIGHT;
-    if (key == AKEYCODE_BACK || key == AKEYCODE_ESCAPE) {
-        if (repeat)
-            return 1;
-        if (a->model.screen == PLAYER)
-            stop_player(a);
-        else if (a->model.screen == DETAILS) {
-            a->model.screen = HOME;
-            a->error[0] = 0;
-        } else
-            ANativeActivity_finish(app->activity);
-        LOG("screen=%d", a->model.screen);
-        return 1;
-    }
-    if (a->model.screen == HOME) {
-        if (left || right) {
-            browse(&a->model, right ? 1 : -1);
-            LOG("focus=%d", a->model.movie);
-        }
-        if (ok && !repeat) {
-            a->model.screen = DETAILS;
-            LOG("screen=details movie=%d", a->model.movie);
-        }
-    } else if (a->model.screen == DETAILS) {
-        if (ok && !repeat)
-            start_player(a);
-    } else {
-        bool visible = controls_visible(&a->model, now()) || a->ended;
-        reveal(&a->model, now());
-        if (key == AKEYCODE_MEDIA_PLAY_PAUSE || key == AKEYCODE_SPACE) {
-            if (!repeat)
-                toggle(a);
-        } else if (key == AKEYCODE_MEDIA_PLAY) {
-            if (a->paused)
-                toggle(a);
-        } else if (key == AKEYCODE_MEDIA_PAUSE) {
-            if (!a->paused)
-                toggle(a);
-        } else if (key == AKEYCODE_MEDIA_FAST_FORWARD)
-            seek(a, 10000);
-        else if (key == AKEYCODE_MEDIA_REWIND)
-            seek(a, -10000);
-        else if (visible) {
-            if (left)
-                a->model.control = (a->model.control + 2) % 3;
-            if (right)
-                a->model.control = (a->model.control + 1) % 3;
-            if (ok && !repeat) {
-                if (a->model.control == 1)
-                    toggle(a);
-                else
-                    seek(a, a->model.control == 0 ? -10000 : 10000);
-            }
-        }
-    }
+    Screen before = a->core.model.screen;
+    int movie = a->core.model.movie;
+    perform(a, ember_key(&a->core, key, repeat, now()));
+    if (key == EK_BACK && !repeat)
+        LOG("screen=%d", a->core.model.screen);
+    else if (before == HOME && a->core.model.screen == DETAILS)
+        LOG("screen=details movie=%d", a->core.model.movie);
+    else if (a->core.model.movie != movie)
+        LOG("focus=%d", a->core.model.movie);
     return 1;
 }
 static void init_gl(App *a) {
@@ -676,7 +619,7 @@ void android_main(struct android_app *app) {
     App a = {0};
     a.app = app;
     a.display = EGL_NO_DISPLAY;
-    a.model.screen = HOME;
+    ember_init(&a.core);
     a.active = true;
     atomic_init(&a.loading, 0);
     (*app->activity->vm)->AttachCurrentThread(app->activity->vm, &a.env, 0);
